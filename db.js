@@ -83,7 +83,7 @@ async function seedExampleQuiz() {
       {
         text: 'Что нужно сделать, чтобы начать общение с ботом?',
         options: [
-          'Найти бота по имени и нажать «Start»',
+          'Найти бота по имени и нажать "Start"',
           'Написать в поддержку Telegram',
           'Включить VPN',
           'Добавить бота в контакты телефона'
@@ -93,12 +93,14 @@ async function seedExampleQuiz() {
     ];
 
     for (const q of questions) {
+      // ✅ JSON.stringify + убираем “умные” кавычки
+      const safeOptions = q.options.map(o => o.replace(/[“”«»]/g, '"'));
       await client.query(
         `
         INSERT INTO questions (quiz_id, text, options, correct_option)
         VALUES ($1, $2, $3, $4)
         `,
-        [quizId, q.text, q.options, q.correct]
+        [quizId, q.text, JSON.stringify(safeOptions), q.correct]
       );
     }
 
@@ -171,12 +173,13 @@ const dal = {
       const quizId = quizRes.rows[0].id;
 
       for (const q of quizData.questions) {
+        const safeOptions = q.options.map(o => o.replace(/[“”«»]/g, '"'));
         await client.query(
           `
           INSERT INTO questions (quiz_id, text, options, correct_option)
           VALUES ($1, $2, $3, $4)
           `,
-          [quizId, q.text, q.options, q.correctOption]
+          [quizId, q.text, JSON.stringify(safeOptions), q.correctOption]
         );
       }
 
