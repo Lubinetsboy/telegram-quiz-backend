@@ -1,203 +1,254 @@
-const path = require('path');
 const fs = require('fs');
-const Database = require('better-sqlite3');
+const path = require('path');
+const { Pool } = require('pg');
 
-const DEFAULT_SQLITE_PATH = path.join(__dirname, 'database.sqlite');
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production'
+    ? { rejectUnauthorized: false }
+    : false
+});
 
-function getDbPathFromEnv() {
-  const url = process.env.DATABASE_URL;
-  if (!url) return DEFAULT_SQLITE_PATH;
+// --- ИНИЦИАЛИЗАЦИЯ СХЕМЫ ---
 
-  if (url.startsWith('sqlite:')) {
-    return url.replace('sqlite:', '');
-  }
-
-  // Fallback: treat as plain path
-  return url;
-}
-
-const dbPath = getDbPathFromEnv();
-const db = new Database(dbPath);
-
-function initSchema() {
+async function initSchema() {
   const schemaPath = path.join(__dirname, 'db', 'schema.sql');
+
+  let sql;
   if (fs.existsSync(schemaPath)) {
-    const sql = fs.readFileSync(schemaPath, 'utf8');
-    db.exec(sql);
+    sql = fs.readFileSync(schemaPath, 'utf8');
   } else {
-    // Fallback in case schema.sql is missing
-    db.exec(`
+    sql = `
       CREATE TABLE IF NOT EXISTS quizzes (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         title TEXT NOT NULL,
         created_by TEXT,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
 
       CREATE TABLE IF NOT EXISTS questions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        quiz_id INTEGER NOT NULL,
+        id SERIAL PRIMARY KEY,
+        quiz_id INTEGER NOT NULL REFERENCES quizzes(id) ON DELETE CASCADE,
         text TEXT NOT NULL,
-        options TEXT NOT NULL,
-        correct_option INTEGER NOT NULL,
-        FOREIGN KEY (quiz_id) REFERENCES quizzes(id) ON DELETE CASCADE
+        options JSONB NOT NULL,
+        correct_option INTEGER NOT NULL
       );
 
       CREATE TABLE IF NOT EXISTS answers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         user_id TEXT NOT NULL,
-        quiz_id INTEGER NOT NULL,
-        question_id INTEGER NOT NULL,
+        quiz_id INTEGER NOT NULL REFERENCES quizzes(id) ON DELETE CASCADE,
+        question_id INTEGER NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
         selected_option INTEGER NOT NULL,
-        correct INTEGER NOT NULL,
-        timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (quiz_id) REFERENCES quizzes(id) ON DELETE CASCADE,
-        FOREIGN KEY (question_id) REFERENCES questions(id) ON DELETE CASCADE
+        correct BOOLEAN NOT NULL,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
-    `);
+    `;
   }
 
-  seedExampleQuiz();
+  await pool.query(sql);
+  await seedExampleQuiz();
 }
 
-function seedExampleQuiz() {
-  const countStmt = db.prepare('SELECT COUNT(*) as count FROM quizzes');
-  const { count } = countStmt.get();
-  if (count > 0) return;
+// --- НАЧАЛЬНЫЕ ДАННЫЕ ---
 
-  const insertQuiz = db.prepare(
-    'INSERT INTO quizzes (title, created_by) VALUES (?, ?)'
+async function seedExampleQuiz() {
+  const { rows } = await pool.query(
+    'SELECT COUNT(*)::int AS count FROM quizzes'
   );
-  const insertQuestion = db.prepare(
-    'INSERT INTO questions (quiz_id, text, options, correct_option) VALUES (?, ?, ?, ?)'
-  );
+
+  if (rows[0].count > 0) return;
 
   const quizTitle = 'Пример викторины: Основы Telegram';
   const adminId = 'system';
 
-  const transaction = db.transaction(() => {
-    const info = insertQuiz.run(quizTitle, adminId);
-    const quizId = info.lastInsertRowid;
+  const client = await pool.connect();
 
-    insertQuestion.run(
-      quizId,
-      'Как называется официальный клиент мессенджера на смартфонах?',
-      JSON.stringify(['Telegram', 'Telegraph', 'Telechat', 'MessageMe']),
-      0
+  try {
+    await client.query('BEGIN');
+
+    const quizRes = await client.query(
+      'INSERT INTO quizzes (title, created_by) VALUES ($1, $2) RETURNING id',
+      [quizTitle, adminId]
     );
 
-    insertQuestion.run(
-      quizId,
-      'Что нужно сделать, чтобы начать общение с ботом?',
-      JSON.stringify([
-        'Найти бота по имени и нажать «Start»',
-        'Написать в поддержку Telegram',
-        'Включить VPN',
-        'Добавить бота в контакты телефона'
-      ]),
-      0
-    );
-  });
+    const quizId = quizRes.rows[0].id;
 
-  transaction();
+    const questions = [
+      {
+        text: 'Как называется официальный клиент мессенджера на смартфонах?',
+        options: ['Telegram', 'Telegraph', 'Telechat', 'MessageMe'],
+        correct: 0
+      },
+      {
+        text: 'Что нужно сделать, чтобы начать общение с ботом?',
+        options: [
+          'Найти бота по имени и нажать «Start»',
+          'Написать в поддержку Telegram',
+          'Включить VPN',
+          'Добавить бота в контакты телефона'
+        ],
+        correct: 0
+      }
+    ];
+
+    for (const q of questions) {
+      await client.query(
+        `
+        INSERT INTO questions (quiz_id, text, options, correct_option)
+        VALUES ($1, $2, $3, $4)
+        `,
+        [quizId, q.text, q.options, q.correct]
+      );
+    }
+
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
-initSchema();
+// --- DATA ACCESS LAYER ---
 
-// Data access layer – makes switching DBs easier later
 const dal = {
-  getAllQuizzes() {
-    const stmt = db.prepare(
-      'SELECT id, title, created_by, created_at FROM quizzes ORDER BY created_at DESC'
+  async getAllQuizzes() {
+    const { rows } = await pool.query(
+      `
+      SELECT id, title, created_by, created_at
+      FROM quizzes
+      ORDER BY created_at DESC
+      `
     );
-    return stmt.all();
+    return rows;
   },
 
-  getQuizWithQuestions(quizId) {
-    const quizStmt = db.prepare(
-      'SELECT id, title, created_by, created_at FROM quizzes WHERE id = ?'
+  async getQuizWithQuestions(quizId) {
+    const quizRes = await pool.query(
+      `
+      SELECT id, title, created_by, created_at
+      FROM quizzes
+      WHERE id = $1
+      `,
+      [quizId]
     );
-    const quiz = quizStmt.get(quizId);
-    if (!quiz) return null;
 
-    const questionsStmt = db.prepare(
-      'SELECT id, text, options, correct_option FROM questions WHERE quiz_id = ? ORDER BY id ASC'
+    if (quizRes.rows.length === 0) return null;
+
+    const questionsRes = await pool.query(
+      `
+      SELECT id, text, options, correct_option
+      FROM questions
+      WHERE quiz_id = $1
+      ORDER BY id ASC
+      `,
+      [quizId]
     );
-    const questions = questionsStmt.all(quizId).map((q) => ({
-      ...q,
-      options: JSON.parse(q.options)
-    }));
 
-    return { quiz, questions };
+    return {
+      quiz: quizRes.rows[0],
+      questions: questionsRes.rows
+    };
   },
 
-  createQuiz(quizData) {
-    const insertQuiz = db.prepare(
-      'INSERT INTO quizzes (title, created_by) VALUES (?, ?)'
-    );
-    const insertQuestion = db.prepare(
-      'INSERT INTO questions (quiz_id, text, options, correct_option) VALUES (?, ?, ?, ?)'
-    );
+  async createQuiz(quizData) {
+    const client = await pool.connect();
 
-    const transaction = db.transaction(() => {
-      const info = insertQuiz.run(quizData.title, quizData.createdBy);
-      const quizId = info.lastInsertRowid;
+    try {
+      await client.query('BEGIN');
+
+      const quizRes = await client.query(
+        `
+        INSERT INTO quizzes (title, created_by)
+        VALUES ($1, $2)
+        RETURNING id
+        `,
+        [quizData.title, quizData.createdBy]
+      );
+
+      const quizId = quizRes.rows[0].id;
 
       for (const q of quizData.questions) {
-        insertQuestion.run(
-          quizId,
-          q.text,
-          JSON.stringify(q.options),
-          q.correctOption
+        await client.query(
+          `
+          INSERT INTO questions (quiz_id, text, options, correct_option)
+          VALUES ($1, $2, $3, $4)
+          `,
+          [quizId, q.text, q.options, q.correctOption]
         );
       }
 
+      await client.query('COMMIT');
       return quizId;
-    });
-
-    return transaction();
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
   },
 
-  saveQuizAnswers(userId, quizId, answers) {
-    const insertAnswer = db.prepare(
-      'INSERT INTO answers (user_id, quiz_id, question_id, selected_option, correct) VALUES (?, ?, ?, ?, ?)'
-    );
+  async saveQuizAnswers(userId, quizId, answers) {
+    const client = await pool.connect();
 
-    const transaction = db.transaction(() => {
+    try {
+      await client.query('BEGIN');
+
       for (const a of answers) {
-        insertAnswer.run(
-          String(userId),
-          quizId,
-          a.questionId,
-          a.selectedOption,
-          a.correct ? 1 : 0
+        await client.query(
+          `
+          INSERT INTO answers
+          (user_id, quiz_id, question_id, selected_option, correct)
+          VALUES ($1, $2, $3, $4, $5)
+          `,
+          [
+            String(userId),
+            quizId,
+            a.questionId,
+            a.selectedOption,
+            !!a.correct
+          ]
         );
       }
-    });
 
-    transaction();
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
   },
 
-  getUserResults(userId, limit = 10) {
-    const stmt = db.prepare(
+  async getUserResults(userId, limit = 10) {
+    const { rows } = await pool.query(
       `
       SELECT
-        q.id as quiz_id,
+        q.id AS quiz_id,
         q.title,
-        COUNT(a.id) as total_answers,
-        SUM(a.correct) as correct_answers,
-        MAX(a.timestamp) as last_taken_at
+        COUNT(a.id) AS total_answers,
+        SUM(CASE WHEN a.correct THEN 1 ELSE 0 END) AS correct_answers,
+        MAX(a.timestamp) AS last_taken_at
       FROM answers a
       JOIN quizzes q ON a.quiz_id = q.id
-      WHERE a.user_id = ?
+      WHERE a.user_id = $1
       GROUP BY q.id, q.title
       ORDER BY last_taken_at DESC
-      LIMIT ?
-    `
+      LIMIT $2
+      `,
+      [String(userId), limit]
     );
 
-    return stmt.all(String(userId), limit);
+    return rows;
   }
 };
+
+// --- СТАРТ ---
+
+initSchema()
+  .then(() => console.log('Database initialized'))
+  .catch(console.error);
 
 module.exports = dal;
