@@ -31,9 +31,9 @@ app.use(express.json());
 app.use(morgan('dev'));
 
 // API routes for Web App
-app.get('/api/quizzes', (req, res) => {
+app.get('/api/quizzes', async (req, res) => {
   try {
-    const quizzes = dal.getAllQuizzes();
+    const quizzes = await dal.getAllQuizzes();
     res.json({ quizzes });
   } catch (err) {
     console.error('Error fetching quizzes', err);
@@ -41,10 +41,11 @@ app.get('/api/quizzes', (req, res) => {
   }
 });
 
-app.get('/api/quizzes/:id', (req, res) => {
+
+app.get('/api/quizzes/:id', async (req, res) => {
   try {
     const quizId = Number(req.params.id);
-    const data = dal.getQuizWithQuestions(quizId);
+    const data = await dal.getQuizWithQuestions(quizId);
     if (!data) {
       return res.status(404).json({ error: 'Викторина не найдена' });
     }
@@ -54,6 +55,7 @@ app.get('/api/quizzes/:id', (req, res) => {
     res.status(500).json({ error: 'Ошибка при загрузке викторины' });
   }
 });
+
 
 // Serve React build
 const distPath = path.join(__dirname, '..', 'frontend', 'dist');
