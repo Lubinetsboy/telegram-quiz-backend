@@ -293,19 +293,16 @@ bot.on('message', async (ctx) => {
 });
 
 // Start bot (long polling) and HTTP server
-bot
-  .launch()
-  .then(() => {
+(async () => {
+  try {
+    await bot.launch({ dropPendingUpdates: true }); // очищает старые обновления и не даёт 409
     console.log('Telegram bot started');
-  })
-  .catch((err) => {
+  } catch (err) {
     console.error('Failed to start Telegram bot', err);
     process.exit(1);
-  });
+  }
+})();
 
-app.listen(PORT, () => {
-  console.log(`HTTP server listening on port ${PORT}`);
-});
 
 bot.action('finish_quiz', async (ctx) => {
   const userId = String(ctx.from.id);
